@@ -21,7 +21,7 @@ import { loadPluginManifestRegistry } from "./manifest-registry.js";
 import { isPathInside, safeStatSync } from "./path-safety.js";
 import { createPluginRegistry, type PluginRecord, type PluginRegistry } from "./registry.js";
 import { setActivePluginRegistry } from "./runtime.js";
-import { createPluginRuntime } from "./runtime/index.js";
+import { createPluginRuntime, type CreatePluginRuntimeOptions } from "./runtime/index.js";
 import type { PluginRuntime } from "./runtime/types.js";
 import { validateJsonSchemaValue } from "./schema-validator.js";
 import type {
@@ -38,6 +38,7 @@ export type PluginLoadOptions = {
   workspaceDir?: string;
   logger?: PluginLogger;
   coreGatewayHandlers?: Record<string, GatewayRequestHandler>;
+  runtimeOptions?: CreatePluginRuntimeOptions;
   cache?: boolean;
   mode?: "full" | "validate";
 };
@@ -54,19 +55,15 @@ const resolvePluginSdkAliasFile = (params: {
   try {
     const modulePath = params.modulePath ?? fileURLToPath(import.meta.url);
     const isProduction = process.env.NODE_ENV === "production";
-    const isTest = process.env.VITEST || process.env.NODE_ENV === "test";
     const normalizedModulePath = modulePath.replace(/\\/g, "/");
     const isDistRuntime = normalizedModulePath.includes("/dist/");
     let cursor = path.dirname(modulePath);
     for (let i = 0; i < 6; i += 1) {
       const srcCandidate = path.join(cursor, "src", "plugin-sdk", params.srcFile);
       const distCandidate = path.join(cursor, "dist", "plugin-sdk", params.distFile);
-      const orderedCandidates = isDistRuntime
-        ? [distCandidate, srcCandidate]
-        : isProduction
-          ? isTest
-            ? [distCandidate, srcCandidate]
-            : [distCandidate]
+      const orderedCandidates =
+        isDistRuntime || isProduction
+          ? [distCandidate, srcCandidate]
           : [srcCandidate, distCandidate];
       for (const candidate of orderedCandidates) {
         if (fs.existsSync(candidate)) {
@@ -503,7 +500,7 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
   // not eagerly load every channel runtime dependency.
   let resolvedRuntime: PluginRuntime | null = null;
   const resolveRuntime = (): PluginRuntime => {
-    resolvedRuntime ??= createPluginRuntime();
+    resolvedRuntime ??= createPluginRuntime(options.runtimeOptions);
     return resolvedRuntime;
   };
   const runtime = new Proxy({} as PluginRuntime, {
