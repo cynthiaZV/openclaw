@@ -1,64 +1,111 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { withTempHome } from "./home-env.test-harness.js";
+// Covers runtime snapshot writes produced by config IO.
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  clearConfigCache,
-  clearRuntimeConfigSnapshot,
-  loadConfig,
+  projectConfigOntoRuntimeSourceSnapshot,
+  resetConfigRuntimeState,
+  setRuntimeConfigSnapshotRefreshHandler,
   setRuntimeConfigSnapshot,
-  writeConfigFile,
 } from "./io.js";
+import { createProviderConfigFixture } from "./runtime-snapshot.test-fixtures.js";
 import type { OpenClawConfig } from "./types.js";
 
+function resetRuntimeConfigState(): void {
+  setRuntimeConfigSnapshotRefreshHandler(null);
+  resetConfigRuntimeState();
+}
+
 describe("runtime config snapshot writes", () => {
-  it("preserves source secret refs when writeConfigFile receives runtime-resolved config", async () => {
-    await withTempHome("openclaw-config-runtime-write-", async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
-      const sourceConfig: OpenClawConfig = {
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-              models: [],
-            },
-          },
+  beforeEach(() => {
+    resetRuntimeConfigState();
+  });
+
+  afterEach(() => {
+    resetRuntimeConfigState();
+  });
+
+  it("skips source projection for non-runtime-derived configs", () => {
+    const sourceConfig: OpenClawConfig = {
+      ...createProviderConfigFixture(),
+      gateway: {
+        auth: {
+          mode: "token",
         },
-      };
-      const runtimeConfig: OpenClawConfig = {
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: "sk-runtime-resolved",
-              models: [],
-            },
-          },
+      },
+    };
+    const runtimeConfig: OpenClawConfig = {
+      ...createProviderConfigFixture("sk-runtime-resolved"), // pragma: allowlist secret
+      gateway: {
+        auth: {
+          mode: "token",
         },
-      };
+      },
+    };
+    const independentConfig = createProviderConfigFixture("sk-independent-config"); // pragma: allowlist secret
 
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, `${JSON.stringify(sourceConfig, null, 2)}\n`, "utf8");
+    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
+    const projected = projectConfigOntoRuntimeSourceSnapshot(independentConfig);
+    expect(projected).toBe(independentConfig);
+  });
 
-      try {
-        setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-        expect(loadConfig().models?.providers?.openai?.apiKey).toBe("sk-runtime-resolved");
+  it("isolates untouched source descendants when projecting runtime edits", () => {
+    const sourceConfig: OpenClawConfig = {
+      ...createProviderConfigFixture(),
+      gateway: { mode: "local", port: 19001 },
+      tools: { exec: { safeBins: ["jq"] } },
+    };
+    const runtimeConfig: OpenClawConfig = {
+      ...sourceConfig,
+      ...createProviderConfigFixture("synthetic-runtime-value"),
+    };
+    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
+    const projected = projectConfigOntoRuntimeSourceSnapshot({
+      ...runtimeConfig,
+      gateway: { ...runtimeConfig.gateway, port: 19002 },
+    });
+    const safeBins = projected.tools?.exec?.safeBins;
+    if (!safeBins) {
+      throw new Error("expected projected safe bins");
+    }
+    safeBins.push("cut");
+    expect(sourceConfig.tools?.exec?.safeBins).toEqual(["jq"]);
+    expect(projected.models).toEqual(sourceConfig.models);
+    expect(projected.gateway?.port).toBe(19002);
+  });
 
-        await writeConfigFile(loadConfig());
+  it("retains an empty object for a changed runtime subtree", () => {
+    const sourceConfig: OpenClawConfig = { gateway: { port: 18789 } };
+    const runtimeConfig: OpenClawConfig = {
+      gateway: { port: 18789, auth: { mode: "token", allowTailscale: true } },
+    };
+    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
 
-        const persisted = JSON.parse(await fs.readFile(configPath, "utf8")) as {
-          models?: { providers?: { openai?: { apiKey?: unknown } } };
-        };
-        expect(persisted.models?.providers?.openai?.apiKey).toEqual({
-          source: "env",
-          provider: "default",
-          id: "OPENAI_API_KEY",
-        });
-      } finally {
-        clearRuntimeConfigSnapshot();
-        clearConfigCache();
-      }
+    const projected = projectConfigOntoRuntimeSourceSnapshot({
+      gateway: { port: 18789, auth: { mode: "token" } },
+    });
+
+    expect(projected).toStrictEqual({ gateway: { port: 18789, auth: {} } });
+  });
+
+  it("preserves literal nulls and omissions when projecting a runtime edit", () => {
+    const sourceConfig: OpenClawConfig = {
+      ...createProviderConfigFixture(),
+      agents: { defaults: { params: { temperature: 0.2, topP: 0.8 } } },
+    };
+    const runtimeConfig: OpenClawConfig = {
+      ...createProviderConfigFixture("synthetic-runtime-value"),
+      agents: { defaults: { ...sourceConfig.agents?.defaults, maxConcurrent: 4 } },
+    };
+    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
+    const params = { temperature: null, nested: { value: null } };
+
+    const projected = projectConfigOntoRuntimeSourceSnapshot({
+      ...runtimeConfig,
+      agents: { defaults: { ...runtimeConfig.agents?.defaults, params } },
+    });
+
+    expect(projected).toStrictEqual({
+      ...sourceConfig,
+      agents: { defaults: { params } },
     });
   });
 });

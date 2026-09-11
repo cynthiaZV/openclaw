@@ -1,3 +1,4 @@
+// Mattermost tests cover normalize plugin behavior.
 import { describe, expect, it } from "vitest";
 import { looksLikeMattermostTargetId, normalizeMattermostMessagingTarget } from "./normalize.js";
 
@@ -74,12 +75,12 @@ describe("looksLikeMattermostTargetId", () => {
   it("recognizes 26-char alphanumeric Mattermost IDs", () => {
     expect(looksLikeMattermostTargetId("abcdefghijklmnopqrstuvwxyz")).toBe(true);
     expect(looksLikeMattermostTargetId("12345678901234567890123456")).toBe(true);
-    expect(looksLikeMattermostTargetId("AbCdEf1234567890abcdef1234")).toBe(true);
+    expect(looksLikeMattermostTargetId("AbCdEf1234567890abcdef1234")).toBe(true); // pragma: allowlist secret
   });
 
   it("recognizes DM channel format (26__26)", () => {
     expect(
-      looksLikeMattermostTargetId("abcdefghijklmnopqrstuvwxyz__12345678901234567890123456"),
+      looksLikeMattermostTargetId("abcdefghijklmnopqrstuvwxyz__12345678901234567890123456"), // pragma: allowlist secret
     ).toBe(true);
   });
 
@@ -91,6 +92,6 @@ describe("looksLikeMattermostTargetId", () => {
   });
 
   it("rejects strings longer than 26 chars that are not DM format", () => {
-    expect(looksLikeMattermostTargetId("abcdefghijklmnopqrstuvwxyz1")).toBe(false);
+    expect(looksLikeMattermostTargetId("abcdefghijklmnopqrstuvwxyz1")).toBe(false); // pragma: allowlist secret
   });
 });

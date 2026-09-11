@@ -1,8 +1,9 @@
+// Covers gateway auth mode validation when token and password inputs are both
+// configured directly or via secret defaults.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import {
   assertExplicitGatewayAuthModeWhenBothConfigured,
-  EXPLICIT_GATEWAY_AUTH_MODE_REQUIRED_ERROR,
   hasAmbiguousGatewayAuthModeConfig,
 } from "./auth-mode-policy.js";
 
@@ -13,7 +14,7 @@ describe("gateway auth mode policy", () => {
         auth: {
           mode: "token",
           token: "token-value",
-          password: "password-value",
+          password: "password-value", // pragma: allowlist secret
         },
       },
     };
@@ -36,7 +37,7 @@ describe("gateway auth mode policy", () => {
       gateway: {
         auth: {
           token: "token-value",
-          password: "password-value",
+          password: "password-value", // pragma: allowlist secret
         },
       },
     };
@@ -65,12 +66,12 @@ describe("gateway auth mode policy", () => {
       gateway: {
         auth: {
           token: "token-value",
-          password: "password-value",
+          password: "password-value", // pragma: allowlist secret
         },
       },
     };
     expect(() => assertExplicitGatewayAuthModeWhenBothConfigured(cfg)).toThrow(
-      EXPLICIT_GATEWAY_AUTH_MODE_REQUIRED_ERROR,
+      /gateway\.auth\.mode is unset/u,
     );
   });
 });

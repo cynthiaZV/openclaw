@@ -1,605 +1,130 @@
-import path from "node:path";
-import type { AnyAgentTool } from "../agents/tools/common.js";
-import type { ChannelDock } from "../channels/dock.js";
-import type { ChannelPlugin } from "../channels/plugins/types.js";
+/** In-memory plugin registry builder and mutation API for plugin runtime registration. */
+import { cleanupPluginSessionSchedulerJobs } from "./host-hook-runtime.js";
+import { createPluginApiFactory } from "./registry-api.js";
+import { getPluginRegistryInspectionResources } from "./registry-inspection-resources.js";
+import { createPluginRegistrars } from "./registry-registrars.js";
+import { createPluginRuntimeResolver } from "./registry-runtime.js";
+import { createPluginRegistryState } from "./registry-state.js";
 import type {
-  GatewayRequestHandler,
-  GatewayRequestHandlers,
-} from "../gateway/server-methods/types.js";
-import { registerInternalHook } from "../hooks/internal-hooks.js";
-import type { HookEntry } from "../hooks/types.js";
-import { resolveUserPath } from "../utils.js";
-import { registerPluginCommand } from "./commands.js";
-import { normalizePluginHttpPath } from "./http-path.js";
-import type { PluginRuntime } from "./runtime/types.js";
-import {
-  isPluginHookName,
-  isPromptInjectionHookName,
-  stripPromptMutationFieldsFromLegacyHookResult,
-} from "./types.js";
-import type {
-  OpenClawPluginApi,
-  OpenClawPluginChannelRegistration,
-  OpenClawPluginCliRegistrar,
-  OpenClawPluginCommandDefinition,
-  OpenClawPluginHttpRouteAuth,
-  OpenClawPluginHttpRouteMatch,
-  OpenClawPluginHttpRouteHandler,
-  OpenClawPluginHttpRouteParams,
-  OpenClawPluginHookOptions,
-  ProviderPlugin,
-  OpenClawPluginService,
-  OpenClawPluginToolContext,
-  OpenClawPluginToolFactory,
-  PluginConfigUiHint,
-  PluginDiagnostic,
-  PluginLogger,
-  PluginOrigin,
-  PluginKind,
-  PluginHookName,
-  PluginHookHandlerMap,
-  PluginHookRegistration as TypedPluginHookRegistration,
-} from "./types.js";
+  PluginHttpRouteRegistration as RegistryTypesPluginHttpRouteRegistration,
+  PluginRecord as RegistryPluginRecord,
+  PluginRegistryParams,
+} from "./registry-types.js";
+import type { OpenClawPluginGatewayRuntimeScopeSurface } from "./types.js";
 
-export type PluginToolRegistration = {
-  pluginId: string;
-  factory: OpenClawPluginToolFactory;
-  names: string[];
-  optional: boolean;
-  source: string;
+export type PluginHttpRouteRegistration = RegistryTypesPluginHttpRouteRegistration & {
+  gatewayRuntimeScopeSurface?: OpenClawPluginGatewayRuntimeScopeSurface;
 };
 
-export type PluginCliRegistration = {
-  pluginId: string;
-  register: OpenClawPluginCliRegistrar;
-  commands: string[];
-  source: string;
-};
+export type { PluginRecord, PluginRegistry } from "./registry-types.js";
+export { createEmptyPluginRegistry } from "./registry-empty.js";
 
-export type PluginHttpRouteRegistration = {
-  pluginId?: string;
-  path: string;
-  handler: OpenClawPluginHttpRouteHandler;
-  auth: OpenClawPluginHttpRouteAuth;
-  match: OpenClawPluginHttpRouteMatch;
-  source?: string;
-};
-
-export type PluginChannelRegistration = {
-  pluginId: string;
-  plugin: ChannelPlugin;
-  dock?: ChannelDock;
-  source: string;
-};
-
-export type PluginProviderRegistration = {
-  pluginId: string;
-  provider: ProviderPlugin;
-  source: string;
-};
-
-export type PluginHookRegistration = {
-  pluginId: string;
-  entry: HookEntry;
-  events: string[];
-  source: string;
-};
-
-export type PluginServiceRegistration = {
-  pluginId: string;
-  service: OpenClawPluginService;
-  source: string;
-};
-
-export type PluginCommandRegistration = {
-  pluginId: string;
-  command: OpenClawPluginCommandDefinition;
-  source: string;
-};
-
-export type PluginRecord = {
-  id: string;
-  name: string;
-  version?: string;
-  description?: string;
-  kind?: PluginKind;
-  source: string;
-  origin: PluginOrigin;
-  workspaceDir?: string;
-  enabled: boolean;
-  status: "loaded" | "disabled" | "error";
-  error?: string;
-  toolNames: string[];
-  hookNames: string[];
-  channelIds: string[];
-  providerIds: string[];
-  gatewayMethods: string[];
-  cliCommands: string[];
-  services: string[];
-  commands: string[];
-  httpRoutes: number;
-  hookCount: number;
-  configSchema: boolean;
-  configUiHints?: Record<string, PluginConfigUiHint>;
-  configJsonSchema?: Record<string, unknown>;
-};
-
-export type PluginRegistry = {
-  plugins: PluginRecord[];
-  tools: PluginToolRegistration[];
-  hooks: PluginHookRegistration[];
-  typedHooks: TypedPluginHookRegistration[];
-  channels: PluginChannelRegistration[];
-  providers: PluginProviderRegistration[];
-  gatewayHandlers: GatewayRequestHandlers;
-  httpRoutes: PluginHttpRouteRegistration[];
-  cliRegistrars: PluginCliRegistration[];
-  services: PluginServiceRegistration[];
-  commands: PluginCommandRegistration[];
-  diagnostics: PluginDiagnostic[];
-};
-
-export type PluginRegistryParams = {
-  logger: PluginLogger;
-  coreGatewayHandlers?: GatewayRequestHandlers;
-  runtime: PluginRuntime;
-};
-
-type PluginTypedHookPolicy = {
-  allowPromptInjection?: boolean;
-};
-
-const constrainLegacyPromptInjectionHook = (
-  handler: PluginHookHandlerMap["before_agent_start"],
-): PluginHookHandlerMap["before_agent_start"] => {
-  return (event, ctx) => {
-    const result = handler(event, ctx);
-    if (result && typeof result === "object" && "then" in result) {
-      return Promise.resolve(result).then((resolved) =>
-        stripPromptMutationFieldsFromLegacyHookResult(resolved),
-      );
-    }
-    return stripPromptMutationFieldsFromLegacyHookResult(result);
-  };
-};
-
-export function createEmptyPluginRegistry(): PluginRegistry {
-  return {
-    plugins: [],
-    tools: [],
-    hooks: [],
-    typedHooks: [],
-    channels: [],
-    providers: [],
-    gatewayHandlers: {},
-    httpRoutes: [],
-    cliRegistrars: [],
-    services: [],
-    commands: [],
-    diagnostics: [],
-  };
+function clonePluginRecord(record: RegistryPluginRecord): RegistryPluginRecord {
+  return Object.fromEntries(
+    Object.entries(record).map(([key, value]) => [key, Array.isArray(value) ? [...value] : value]),
+  ) as RegistryPluginRecord;
 }
 
+function restorePluginRecord(record: RegistryPluginRecord, snapshot: RegistryPluginRecord): void {
+  Object.keys(record).forEach((key) => Reflect.deleteProperty(record, key));
+  Object.assign(record, snapshot);
+}
+
+/**
+ * Compose the registry state, domain registrars, scoped runtime, and plugin API.
+ * Domain modules own validation and mutation; this function owns lifecycle wiring only.
+ */
 export function createPluginRegistry(registryParams: PluginRegistryParams) {
-  const registry = createEmptyPluginRegistry();
-  const coreGatewayMethods = new Set(Object.keys(registryParams.coreGatewayHandlers ?? {}));
-
-  const pushDiagnostic = (diag: PluginDiagnostic) => {
-    registry.diagnostics.push(diag);
+  const state = createPluginRegistryState(registryParams);
+  const registrars = createPluginRegistrars(state);
+  const runtimeResolver = createPluginRuntimeResolver(state);
+  const { createApi: createPluginApi, deactivatePluginSideEffectGuards } = createPluginApiFactory(
+    state,
+    registrars,
+    runtimeResolver,
+  );
+  const registrationRecordSnapshots = new WeakMap<RegistryPluginRecord, RegistryPluginRecord>();
+  const createApi: typeof createPluginApi = (record, params) => {
+    registrationRecordSnapshots.set(record, clonePluginRecord(record));
+    return createPluginApi(record, params);
   };
 
-  const registerTool = (
-    record: PluginRecord,
-    tool: AnyAgentTool | OpenClawPluginToolFactory,
-    opts?: { name?: string; names?: string[]; optional?: boolean },
-  ) => {
-    const names = opts?.names ?? (opts?.name ? [opts.name] : []);
-    const optional = opts?.optional === true;
-    const factory: OpenClawPluginToolFactory =
-      typeof tool === "function" ? tool : (_ctx: OpenClawPluginToolContext) => tool;
-
-    if (typeof tool !== "function") {
-      names.push(tool.name);
-    }
-
-    const normalized = names.map((name) => name.trim()).filter(Boolean);
-    if (normalized.length > 0) {
-      record.toolNames.push(...normalized);
-    }
-    registry.tools.push({
-      pluginId: record.id,
-      factory,
-      names: normalized,
-      optional,
-      source: record.source,
-    });
-  };
-
-  const registerHook = (
-    record: PluginRecord,
-    events: string | string[],
-    handler: Parameters<typeof registerInternalHook>[1],
-    opts: OpenClawPluginHookOptions | undefined,
-    config: OpenClawPluginApi["config"],
-  ) => {
-    const eventList = Array.isArray(events) ? events : [events];
-    const normalizedEvents = eventList.map((event) => event.trim()).filter(Boolean);
-    const entry = opts?.entry ?? null;
-    const name = entry?.hook.name ?? opts?.name?.trim();
-    if (!name) {
-      pushDiagnostic({
-        level: "warn",
-        pluginId: record.id,
-        source: record.source,
-        message: "hook registration missing name",
-      });
-      return;
-    }
-
-    const description = entry?.hook.description ?? opts?.description ?? "";
-    const hookEntry: HookEntry = entry
-      ? {
-          ...entry,
-          hook: {
-            ...entry.hook,
-            name,
-            description,
-            source: "openclaw-plugin",
-            pluginId: record.id,
-          },
-          metadata: {
-            ...entry.metadata,
-            events: normalizedEvents,
-          },
-        }
-      : {
-          hook: {
-            name,
-            description,
-            source: "openclaw-plugin",
-            pluginId: record.id,
-            filePath: record.source,
-            baseDir: path.dirname(record.source),
-            handlerPath: record.source,
-          },
-          frontmatter: {},
-          metadata: { events: normalizedEvents },
-          invocation: { enabled: true },
-        };
-
-    record.hookNames.push(name);
-    registry.hooks.push({
-      pluginId: record.id,
-      entry: hookEntry,
-      events: normalizedEvents,
-      source: record.source,
-    });
-
-    const hookSystemEnabled = config?.hooks?.internal?.enabled === true;
-    if (!hookSystemEnabled || opts?.register === false) {
-      return;
-    }
-
-    for (const event of normalizedEvents) {
-      registerInternalHook(event, handler);
-    }
-  };
-
-  const registerGatewayMethod = (
-    record: PluginRecord,
-    method: string,
-    handler: GatewayRequestHandler,
-  ) => {
-    const trimmed = method.trim();
-    if (!trimmed) {
-      return;
-    }
-    if (coreGatewayMethods.has(trimmed) || registry.gatewayHandlers[trimmed]) {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: `gateway method already registered: ${trimmed}`,
-      });
-      return;
-    }
-    registry.gatewayHandlers[trimmed] = handler;
-    record.gatewayMethods.push(trimmed);
-  };
-
-  const describeHttpRouteOwner = (entry: PluginHttpRouteRegistration): string => {
-    const plugin = entry.pluginId?.trim() || "unknown-plugin";
-    const source = entry.source?.trim() || "unknown-source";
-    return `${plugin} (${source})`;
-  };
-
-  const registerHttpRoute = (record: PluginRecord, params: OpenClawPluginHttpRouteParams) => {
-    const normalizedPath = normalizePluginHttpPath(params.path);
-    if (!normalizedPath) {
-      pushDiagnostic({
-        level: "warn",
-        pluginId: record.id,
-        source: record.source,
-        message: "http route registration missing path",
-      });
-      return;
-    }
-    if (params.auth !== "gateway" && params.auth !== "plugin") {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: `http route registration missing or invalid auth: ${normalizedPath}`,
-      });
-      return;
-    }
-    const match = params.match ?? "exact";
-    const existingIndex = registry.httpRoutes.findIndex(
-      (entry) => entry.path === normalizedPath && entry.match === match,
+  const rollbackPluginGlobalSideEffects = (pluginId: string, record?: RegistryPluginRecord) => {
+    deactivatePluginSideEffectGuards(pluginId);
+    runtimeResolver.revokePluginRuntimeRecord(pluginId, record);
+    getPluginRegistryInspectionResources(state.registry)?.rollback(pluginId);
+    const schedulerRecords = state.registry.sessionSchedulerJobs.filter(
+      (r) => r.pluginId === pluginId,
     );
-    if (existingIndex >= 0) {
-      const existing = registry.httpRoutes[existingIndex];
-      if (!existing) {
-        return;
+    const gatewayMethods = state.registry.gatewayMethodDescriptors
+      .filter((entry) => entry.owner.kind === "plugin" && entry.owner.pluginId === pluginId)
+      .map((entry) => entry.name);
+    for (const [registryKey, value] of Object.entries(state.registry)) {
+      // Plugin records and diagnostics are operator-visible load outcomes, not registrations.
+      if (registryKey === "plugins" || registryKey === "diagnostics") {
+        continue;
       }
-      if (!params.replaceExisting) {
-        pushDiagnostic({
-          level: "error",
-          pluginId: record.id,
-          source: record.source,
-          message: `http route already registered: ${normalizedPath} (${match}) by ${describeHttpRouteOwner(existing)}`,
-        });
-        return;
-      }
-      if (existing.pluginId && existing.pluginId !== record.id) {
-        pushDiagnostic({
-          level: "error",
-          pluginId: record.id,
-          source: record.source,
-          message: `http route replacement rejected: ${normalizedPath} (${match}) owned by ${describeHttpRouteOwner(existing)}`,
-        });
-        return;
-      }
-      registry.httpRoutes[existingIndex] = {
-        pluginId: record.id,
-        path: normalizedPath,
-        handler: params.handler,
-        auth: params.auth,
-        match,
-        source: record.source,
-      };
-      return;
-    }
-    record.httpRoutes += 1;
-    registry.httpRoutes.push({
-      pluginId: record.id,
-      path: normalizedPath,
-      handler: params.handler,
-      auth: params.auth,
-      match,
-      source: record.source,
-    });
-  };
-
-  const registerChannel = (
-    record: PluginRecord,
-    registration: OpenClawPluginChannelRegistration | ChannelPlugin,
-  ) => {
-    const normalized =
-      typeof (registration as OpenClawPluginChannelRegistration).plugin === "object"
-        ? (registration as OpenClawPluginChannelRegistration)
-        : { plugin: registration as ChannelPlugin };
-    const plugin = normalized.plugin;
-    const id = typeof plugin?.id === "string" ? plugin.id.trim() : String(plugin?.id ?? "").trim();
-    if (!id) {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: "channel registration missing id",
-      });
-      return;
-    }
-    record.channelIds.push(id);
-    registry.channels.push({
-      pluginId: record.id,
-      plugin,
-      dock: normalized.dock,
-      source: record.source,
-    });
-  };
-
-  const registerProvider = (record: PluginRecord, provider: ProviderPlugin) => {
-    const id = typeof provider?.id === "string" ? provider.id.trim() : "";
-    if (!id) {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: "provider registration missing id",
-      });
-      return;
-    }
-    const existing = registry.providers.find((entry) => entry.provider.id === id);
-    if (existing) {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: `provider already registered: ${id} (${existing.pluginId})`,
-      });
-      return;
-    }
-    record.providerIds.push(id);
-    registry.providers.push({
-      pluginId: record.id,
-      provider,
-      source: record.source,
-    });
-  };
-
-  const registerCli = (
-    record: PluginRecord,
-    registrar: OpenClawPluginCliRegistrar,
-    opts?: { commands?: string[] },
-  ) => {
-    const commands = (opts?.commands ?? []).map((cmd) => cmd.trim()).filter(Boolean);
-    record.cliCommands.push(...commands);
-    registry.cliRegistrars.push({
-      pluginId: record.id,
-      register: registrar,
-      commands,
-      source: record.source,
-    });
-  };
-
-  const registerService = (record: PluginRecord, service: OpenClawPluginService) => {
-    const id = service.id.trim();
-    if (!id) {
-      return;
-    }
-    record.services.push(id);
-    registry.services.push({
-      pluginId: record.id,
-      service,
-      source: record.source,
-    });
-  };
-
-  const registerCommand = (record: PluginRecord, command: OpenClawPluginCommandDefinition) => {
-    const name = command.name.trim();
-    if (!name) {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: "command registration missing name",
-      });
-      return;
-    }
-
-    // Register with the plugin command system (validates name and checks for duplicates)
-    const result = registerPluginCommand(record.id, command);
-    if (!result.ok) {
-      pushDiagnostic({
-        level: "error",
-        pluginId: record.id,
-        source: record.source,
-        message: `command registration failed: ${result.error}`,
-      });
-      return;
-    }
-
-    record.commands.push(name);
-    registry.commands.push({
-      pluginId: record.id,
-      command,
-      source: record.source,
-    });
-  };
-
-  const registerTypedHook = <K extends PluginHookName>(
-    record: PluginRecord,
-    hookName: K,
-    handler: PluginHookHandlerMap[K],
-    opts?: { priority?: number },
-    policy?: PluginTypedHookPolicy,
-  ) => {
-    if (!isPluginHookName(hookName)) {
-      pushDiagnostic({
-        level: "warn",
-        pluginId: record.id,
-        source: record.source,
-        message: `unknown typed hook "${String(hookName)}" ignored`,
-      });
-      return;
-    }
-    let effectiveHandler = handler;
-    if (policy?.allowPromptInjection === false && isPromptInjectionHookName(hookName)) {
-      if (hookName === "before_prompt_build") {
-        pushDiagnostic({
-          level: "warn",
-          pluginId: record.id,
-          source: record.source,
-          message: `typed hook "${hookName}" blocked by plugins.entries.${record.id}.hooks.allowPromptInjection=false`,
-        });
-        return;
-      }
-      if (hookName === "before_agent_start") {
-        pushDiagnostic({
-          level: "warn",
-          pluginId: record.id,
-          source: record.source,
-          message: `typed hook "${hookName}" prompt fields constrained by plugins.entries.${record.id}.hooks.allowPromptInjection=false`,
-        });
-        effectiveHandler = constrainLegacyPromptInjectionHook(
-          handler as PluginHookHandlerMap["before_agent_start"],
-        ) as PluginHookHandlerMap[K];
+      if (Array.isArray(value)) {
+        for (let index = value.length - 1; index >= 0; index -= 1) {
+          const entry = value[index] as
+            | { pluginId?: string; ownerPluginId?: string; owner?: { pluginId?: string } }
+            | undefined;
+          if (
+            entry?.pluginId === pluginId ||
+            entry?.ownerPluginId === pluginId ||
+            entry?.owner?.pluginId === pluginId
+          ) {
+            value.splice(index, 1);
+          }
+        }
+      } else if (value instanceof Map) {
+        for (const [key, entry] of value) {
+          const owner = entry as { pluginId?: string; owner?: string } | undefined;
+          if (owner?.pluginId === pluginId || owner?.owner === `plugin:${pluginId}`) {
+            value.delete(key);
+          }
+        }
       }
     }
-    record.hookCount += 1;
-    registry.typedHooks.push({
-      pluginId: record.id,
-      hookName,
-      handler: effectiveHandler,
-      priority: opts?.priority,
-      source: record.source,
-    } as TypedPluginHookRegistration);
-  };
+    for (const method of gatewayMethods) {
+      delete state.registry.gatewayHandlers[method];
+    }
+    for (const key of state.registry.pluginRuntimeArtifacts.keys()) {
+      if ((JSON.parse(key) as unknown[])[0] === pluginId) {
+        state.registry.pluginRuntimeArtifacts.delete(key);
+      }
+    }
+    const recordSnapshot = record ? registrationRecordSnapshots.get(record) : undefined;
+    if (record && recordSnapshot) {
+      restorePluginRecord(record, recordSnapshot);
+      registrationRecordSnapshots.delete(record);
+    }
 
-  const normalizeLogger = (logger: PluginLogger): PluginLogger => ({
-    info: logger.info,
-    warn: logger.warn,
-    error: logger.error,
-    debug: logger.debug,
-  });
-
-  const createApi = (
-    record: PluginRecord,
-    params: {
-      config: OpenClawPluginApi["config"];
-      pluginConfig?: Record<string, unknown>;
-      hookPolicy?: PluginTypedHookPolicy;
-    },
-  ): OpenClawPluginApi => {
-    return {
-      id: record.id,
-      name: record.name,
-      version: record.version,
-      description: record.description,
-      source: record.source,
-      config: params.config,
-      pluginConfig: params.pluginConfig,
-      runtime: registryParams.runtime,
-      logger: normalizeLogger(registryParams.logger),
-      registerTool: (tool, opts) => registerTool(record, tool, opts),
-      registerHook: (events, handler, opts) =>
-        registerHook(record, events, handler, opts, params.config),
-      registerHttpRoute: (params) => registerHttpRoute(record, params),
-      registerChannel: (registration) => registerChannel(record, registration),
-      registerProvider: (provider) => registerProvider(record, provider),
-      registerGatewayMethod: (method, handler) => registerGatewayMethod(record, method, handler),
-      registerCli: (registrar, opts) => registerCli(record, registrar, opts),
-      registerService: (service) => registerService(record, service),
-      registerCommand: (command) => registerCommand(record, command),
-      resolvePath: (input: string) => resolveUserPath(input),
-      on: (hookName, handler, opts) =>
-        registerTypedHook(record, hookName, handler, opts, params.hookPolicy),
-    };
+    // Scheduler jobs still have a live process registration; contribution rollback
+    // drops registry rows above, then cancels external work created before register threw.
+    if (registryParams.activateGlobalSideEffects !== false && schedulerRecords.length > 0) {
+      void cleanupPluginSessionSchedulerJobs({
+        pluginId,
+        reason: "disable",
+        records: schedulerRecords,
+        cleanupOwnerRegistry: state.registry,
+      }).then((failures) => {
+        for (const failure of failures) {
+          state.pushDiagnostic({
+            level: "warn",
+            pluginId: failure.pluginId,
+            message: `scheduler job cleanup failed during rollback: ${failure.hookId}`,
+          });
+        }
+      });
+    }
   };
 
   return {
-    registry,
+    registry: state.registry,
     createApi,
-    pushDiagnostic,
-    registerTool,
-    registerChannel,
-    registerProvider,
-    registerGatewayMethod,
-    registerCli,
-    registerService,
-    registerCommand,
-    registerHook,
-    registerTypedHook,
+    rollbackPluginGlobalSideEffects,
+    pushDiagnostic: state.pushDiagnostic,
+    ...registrars,
   };
 }

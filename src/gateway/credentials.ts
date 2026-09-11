@@ -1,23 +1,47 @@
-import type { OpenClawConfig } from "../config/config.js";
-import { resolveSecretInputRef } from "../config/types.secrets.js";
+// Gateway credential resolution.
+// Selects token/password credentials from explicit, env, local, and remote config inputs.
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  createGatewayCredentialPlan,
+  type GatewayCredentialPlan,
+  trimCredentialToUndefined,
+  trimToUndefined,
+} from "./credential-planner.js";
+export { trimToUndefined } from "./credential-planner.js";
 
 export type ExplicitGatewayAuth = {
   token?: string;
   password?: string;
 };
 
-export type ResolvedGatewayCredentials = {
+/** Trim caller-supplied Gateway credentials without consulting config or environment. */
+export function resolveExplicitGatewayAuth(auth?: ExplicitGatewayAuth): ExplicitGatewayAuth {
+  return {
+    token: trimToUndefined(auth?.token),
+    password: trimToUndefined(auth?.password),
+  };
+}
+
+type ResolvedGatewayCredentials = {
   token?: string;
   password?: string;
 };
 
+/** Selects local Gateway credentials or remote Gateway client credentials. */
 export type GatewayCredentialMode = "local" | "remote";
+
+/** Chooses whether environment credentials or config credentials win for local auth. */
 export type GatewayCredentialPrecedence = "env-first" | "config-first";
+
+/** Chooses whether remote config or environment credentials win for remote client auth. */
 export type GatewayRemoteCredentialPrecedence = "remote-first" | "env-first";
+
+/** Controls whether remote client auth may fall back to env/local credentials. */
 export type GatewayRemoteCredentialFallback = "remote-env-local" | "remote-only";
 
-const GATEWAY_SECRET_REF_UNAVAILABLE_ERROR_CODE = "GATEWAY_SECRET_REF_UNAVAILABLE";
+const GATEWAY_SECRET_REF_UNAVAILABLE_ERROR_CODE = "GATEWAY_SECRET_REF_UNAVAILABLE"; // pragma: allowlist secret
 
+/** Raised when a command path needs Gateway credentials before secret refs were resolved. */
 export class GatewaySecretRefUnavailableError extends Error {
   readonly code = GATEWAY_SECRET_REF_UNAVAILABLE_ERROR_CODE;
   readonly path: string;
@@ -35,6 +59,7 @@ export class GatewaySecretRefUnavailableError extends Error {
   }
 }
 
+/** Type guard for unresolved Gateway secret-ref errors, optionally scoped to a config path. */
 export function isGatewaySecretRefUnavailableError(
   error: unknown,
   expectedPath?: string,
@@ -46,14 +71,6 @@ export function isGatewaySecretRefUnavailableError(
     return true;
   }
   return error.path === expectedPath;
-}
-
-export function trimToUndefined(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function firstDefined(values: Array<string | undefined>): string | undefined {
@@ -69,48 +86,19 @@ function throwUnresolvedGatewaySecretInput(path: string): never {
   throw new GatewaySecretRefUnavailableError(path);
 }
 
-function readGatewayTokenEnv(
-  env: NodeJS.ProcessEnv,
-  includeLegacyEnv: boolean,
-): string | undefined {
-  const primary = trimToUndefined(env.OPENCLAW_GATEWAY_TOKEN);
-  if (primary) {
-    return primary;
-  }
-  if (!includeLegacyEnv) {
-    return undefined;
-  }
-  return trimToUndefined(env.CLAWDBOT_GATEWAY_TOKEN);
-}
-
-function readGatewayPasswordEnv(
-  env: NodeJS.ProcessEnv,
-  includeLegacyEnv: boolean,
-): string | undefined {
-  const primary = trimToUndefined(env.OPENCLAW_GATEWAY_PASSWORD);
-  if (primary) {
-    return primary;
-  }
-  if (!includeLegacyEnv) {
-    return undefined;
-  }
-  return trimToUndefined(env.CLAWDBOT_GATEWAY_PASSWORD);
-}
-
+/** Resolve direct token/password values with caller-selected env-vs-config precedence. */
 export function resolveGatewayCredentialsFromValues(params: {
   configToken?: unknown;
   configPassword?: unknown;
   env?: NodeJS.ProcessEnv;
-  includeLegacyEnv?: boolean;
   tokenPrecedence?: GatewayCredentialPrecedence;
   passwordPrecedence?: GatewayCredentialPrecedence;
 }): ResolvedGatewayCredentials {
   const env = params.env ?? process.env;
-  const includeLegacyEnv = params.includeLegacyEnv ?? true;
-  const envToken = readGatewayTokenEnv(env, includeLegacyEnv);
-  const envPassword = readGatewayPasswordEnv(env, includeLegacyEnv);
-  const configToken = trimToUndefined(params.configToken);
-  const configPassword = trimToUndefined(params.configPassword);
+  const envToken = trimToUndefined(env.OPENCLAW_GATEWAY_TOKEN);
+  const envPassword = trimToUndefined(env.OPENCLAW_GATEWAY_PASSWORD);
+  const configToken = trimCredentialToUndefined(params.configToken);
+  const configPassword = trimCredentialToUndefined(params.configPassword);
   const tokenPrecedence = params.tokenPrecedence ?? "env-first";
   const passwordPrecedence = params.passwordPrecedence ?? "env-first";
 
@@ -119,13 +107,169 @@ export function resolveGatewayCredentialsFromValues(params: {
       ? firstDefined([configToken, envToken])
       : firstDefined([envToken, configToken]);
   const password =
-    passwordPrecedence === "config-first"
+    passwordPrecedence === "config-first" // pragma: allowlist secret
       ? firstDefined([configPassword, envPassword])
       : firstDefined([envPassword, configPassword]);
 
   return { token, password };
 }
 
+function resolveLocalGatewayCredentials(params: {
+  plan: GatewayCredentialPlan;
+  localPrecedence: GatewayCredentialPrecedence;
+}): ResolvedGatewayCredentials {
+  const tokenConfigFallback = params.plan.localToken.configured
+    ? params.plan.localToken.value
+    : params.plan.remoteToken.value;
+  const passwordConfigFallback = params.plan.localPassword.configured
+    ? params.plan.localPassword.value
+    : params.plan.authMode === "trusted-proxy"
+      ? undefined
+      : params.plan.remotePassword.value;
+  const token =
+    params.localPrecedence === "config-first"
+      ? firstDefined([
+          params.plan.localToken.value,
+          params.plan.envToken,
+          params.plan.localToken.configured ? undefined : params.plan.remoteToken.value,
+        ])
+      : firstDefined([params.plan.envToken, tokenConfigFallback]);
+  const password =
+    params.localPrecedence === "config-first"
+      ? firstDefined([
+          params.plan.localPassword.value,
+          params.plan.envPassword,
+          params.plan.localPassword.configured ? undefined : passwordConfigFallback,
+        ])
+      : firstDefined([params.plan.envPassword, passwordConfigFallback]);
+  const localResolved = { token, password };
+  const localPasswordCanWin =
+    params.plan.authMode === "password" ||
+    params.plan.authMode === "trusted-proxy" ||
+    (params.plan.authMode !== "token" && params.plan.authMode !== "none" && !localResolved.token);
+  const localTokenCanWin =
+    params.plan.authMode === "token" ||
+    (params.plan.authMode !== "password" &&
+      params.plan.authMode !== "none" &&
+      params.plan.authMode !== "trusted-proxy" &&
+      !localResolved.password);
+
+  // Config-first callers must not let an env fallback mask a configured but
+  // unresolved secret ref that would otherwise be the active local credential.
+  if (
+    params.plan.localToken.refPath &&
+    params.localPrecedence === "config-first" &&
+    !params.plan.localToken.value &&
+    Boolean(params.plan.envToken) &&
+    localTokenCanWin
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.localToken.refPath);
+  }
+  if (
+    params.plan.localPassword.refPath &&
+    params.localPrecedence === "config-first" && // pragma: allowlist secret
+    !params.plan.localPassword.value &&
+    Boolean(params.plan.envPassword) &&
+    localPasswordCanWin
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.localPassword.refPath);
+  }
+  if (
+    params.plan.localToken.refPath &&
+    !localResolved.token &&
+    !params.plan.envToken &&
+    localTokenCanWin
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.localToken.refPath);
+  }
+  if (
+    params.plan.localPassword.refPath &&
+    !localResolved.password &&
+    !params.plan.envPassword &&
+    localPasswordCanWin
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.localPassword.refPath);
+  }
+  return localResolved;
+}
+
+function resolveRemoteGatewayCredentials(params: {
+  plan: GatewayCredentialPlan;
+  remoteTokenPrecedence: GatewayRemoteCredentialPrecedence;
+  remotePasswordPrecedence: GatewayRemoteCredentialPrecedence;
+  remoteTokenFallback: GatewayRemoteCredentialFallback;
+  remotePasswordFallback: GatewayRemoteCredentialFallback;
+}): ResolvedGatewayCredentials {
+  const token =
+    params.remoteTokenFallback === "remote-only"
+      ? params.plan.remoteToken.value
+      : params.remoteTokenPrecedence === "env-first"
+        ? firstDefined([
+            params.plan.envToken,
+            params.plan.remoteToken.value,
+            params.plan.localToken.value,
+          ])
+        : firstDefined([
+            params.plan.remoteToken.value,
+            params.plan.envToken,
+            params.plan.localToken.value,
+          ]);
+  const password =
+    params.remotePasswordFallback === "remote-only" // pragma: allowlist secret
+      ? params.plan.remotePassword.value
+      : params.remotePasswordPrecedence === "env-first" // pragma: allowlist secret
+        ? firstDefined([
+            params.plan.envPassword,
+            params.plan.remotePassword.value,
+            params.plan.localPassword.value,
+          ])
+        : firstDefined([
+            params.plan.remotePassword.value,
+            params.plan.envPassword,
+            params.plan.localPassword.value,
+          ]);
+  const localTokenFallbackEnabled = params.remoteTokenFallback !== "remote-only";
+  const localTokenFallback =
+    params.remoteTokenFallback === "remote-only" ? undefined : params.plan.localToken.value;
+  const localPasswordFallback =
+    params.remotePasswordFallback === "remote-only" ? undefined : params.plan.localPassword.value; // pragma: allowlist secret
+
+  // Remote-only probe paths intentionally ignore local fallback credentials;
+  // normal remote clients keep them as a last resort for older local config.
+  if (
+    params.plan.remoteToken.refPath &&
+    !token &&
+    !params.plan.envToken &&
+    !localTokenFallback &&
+    !password
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.remoteToken.refPath);
+  }
+  if (
+    params.plan.remotePassword.refPath &&
+    !password &&
+    !params.plan.envPassword &&
+    !localPasswordFallback &&
+    !token
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.remotePassword.refPath);
+  }
+  if (
+    params.plan.localToken.refPath &&
+    localTokenFallbackEnabled &&
+    !token &&
+    !password &&
+    !params.plan.envToken &&
+    !params.plan.remoteToken.value &&
+    params.plan.localTokenCanWin
+  ) {
+    throwUnresolvedGatewaySecretInput(params.plan.localToken.refPath);
+  }
+
+  return { token, password };
+}
+
+/** Resolve Gateway credentials from config, explicit auth, URL overrides, and mode policy. */
 export function resolveGatewayCredentialsFromConfig(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
@@ -133,102 +277,45 @@ export function resolveGatewayCredentialsFromConfig(params: {
   urlOverride?: string;
   urlOverrideSource?: "cli" | "env";
   modeOverride?: GatewayCredentialMode;
-  includeLegacyEnv?: boolean;
-  localTokenPrecedence?: GatewayCredentialPrecedence;
-  localPasswordPrecedence?: GatewayCredentialPrecedence;
+  localPrecedence?: GatewayCredentialPrecedence;
   remoteTokenPrecedence?: GatewayRemoteCredentialPrecedence;
   remotePasswordPrecedence?: GatewayRemoteCredentialPrecedence;
   remoteTokenFallback?: GatewayRemoteCredentialFallback;
   remotePasswordFallback?: GatewayRemoteCredentialFallback;
 }): ResolvedGatewayCredentials {
   const env = params.env ?? process.env;
-  const includeLegacyEnv = params.includeLegacyEnv ?? true;
   const explicitToken = trimToUndefined(params.explicitAuth?.token);
   const explicitPassword = trimToUndefined(params.explicitAuth?.password);
   if (explicitToken || explicitPassword) {
     return { token: explicitToken, password: explicitPassword };
   }
+  // A CLI URL override points at an ad-hoc Gateway, so stored credentials for
+  // the configured Gateway must not leak into that request.
   if (trimToUndefined(params.urlOverride) && params.urlOverrideSource !== "env") {
     return {};
   }
+  // Env URL overrides keep env credentials paired with the same environment.
   if (trimToUndefined(params.urlOverride) && params.urlOverrideSource === "env") {
     return resolveGatewayCredentialsFromValues({
       configToken: undefined,
       configPassword: undefined,
       env,
-      includeLegacyEnv,
       tokenPrecedence: "env-first",
-      passwordPrecedence: "env-first",
+      passwordPrecedence: "env-first", // pragma: allowlist secret
     });
   }
 
-  const mode: GatewayCredentialMode =
-    params.modeOverride ?? (params.cfg.gateway?.mode === "remote" ? "remote" : "local");
-  const remote = params.cfg.gateway?.remote;
-  const defaults = params.cfg.secrets?.defaults;
-  const authMode = params.cfg.gateway?.auth?.mode;
-  const envToken = readGatewayTokenEnv(env, includeLegacyEnv);
-  const envPassword = readGatewayPasswordEnv(env, includeLegacyEnv);
-
-  const localTokenRef = resolveSecretInputRef({
-    value: params.cfg.gateway?.auth?.token,
-    defaults,
-  }).ref;
-  const localPasswordRef = resolveSecretInputRef({
-    value: params.cfg.gateway?.auth?.password,
-    defaults,
-  }).ref;
-  const remoteTokenRef = resolveSecretInputRef({
-    value: remote?.token,
-    defaults,
-  }).ref;
-  const remotePasswordRef = resolveSecretInputRef({
-    value: remote?.password,
-    defaults,
-  }).ref;
-  const remoteToken = remoteTokenRef ? undefined : trimToUndefined(remote?.token);
-  const remotePassword = remotePasswordRef ? undefined : trimToUndefined(remote?.password);
-  const localToken = localTokenRef ? undefined : trimToUndefined(params.cfg.gateway?.auth?.token);
-  const localPassword = localPasswordRef
-    ? undefined
-    : trimToUndefined(params.cfg.gateway?.auth?.password);
-
-  const localTokenPrecedence = params.localTokenPrecedence ?? "env-first";
-  const localPasswordPrecedence = params.localPasswordPrecedence ?? "env-first";
+  const plan = createGatewayCredentialPlan({
+    config: params.cfg,
+    env,
+  });
+  const mode: GatewayCredentialMode = params.modeOverride ?? plan.configuredMode;
 
   if (mode === "local") {
-    // In local mode, prefer gateway.auth.token, but also accept gateway.remote.token
-    // as a fallback for cron commands and other local gateway clients.
-    // This allows users in remote mode to use a single token for all operations.
-    const fallbackToken = localToken ?? remoteToken;
-    const fallbackPassword = localPassword ?? remotePassword;
-    const localResolved = resolveGatewayCredentialsFromValues({
-      configToken: fallbackToken,
-      configPassword: fallbackPassword,
-      env,
-      includeLegacyEnv,
-      tokenPrecedence: localTokenPrecedence,
-      passwordPrecedence: localPasswordPrecedence,
+    return resolveLocalGatewayCredentials({
+      plan,
+      localPrecedence: params.localPrecedence ?? "config-first",
     });
-    const localPasswordCanWin =
-      authMode === "password" ||
-      (authMode !== "token" &&
-        authMode !== "none" &&
-        authMode !== "trusted-proxy" &&
-        !localResolved.token);
-    const localTokenCanWin =
-      authMode === "token" ||
-      (authMode !== "password" &&
-        authMode !== "none" &&
-        authMode !== "trusted-proxy" &&
-        !localResolved.password);
-    if (localTokenRef && !localResolved.token && !envToken && localTokenCanWin) {
-      throwUnresolvedGatewaySecretInput("gateway.auth.token");
-    }
-    if (localPasswordRef && !localResolved.password && !envPassword && localPasswordCanWin) {
-      throwUnresolvedGatewaySecretInput("gateway.auth.password");
-    }
-    return localResolved;
   }
 
   const remoteTokenFallback = params.remoteTokenFallback ?? "remote-env-local";
@@ -236,43 +323,31 @@ export function resolveGatewayCredentialsFromConfig(params: {
   const remoteTokenPrecedence = params.remoteTokenPrecedence ?? "remote-first";
   const remotePasswordPrecedence = params.remotePasswordPrecedence ?? "env-first";
 
-  const token =
-    remoteTokenFallback === "remote-only"
-      ? remoteToken
-      : remoteTokenPrecedence === "env-first"
-        ? firstDefined([envToken, remoteToken, localToken])
-        : firstDefined([remoteToken, envToken, localToken]);
-  const password =
-    remotePasswordFallback === "remote-only"
-      ? remotePassword
-      : remotePasswordPrecedence === "env-first"
-        ? firstDefined([envPassword, remotePassword, localPassword])
-        : firstDefined([remotePassword, envPassword, localPassword]);
+  return resolveRemoteGatewayCredentials({
+    plan,
+    remoteTokenPrecedence,
+    remotePasswordPrecedence,
+    remoteTokenFallback,
+    remotePasswordFallback,
+  });
+}
 
-  const localTokenCanWin =
-    authMode === "token" ||
-    (authMode !== "password" && authMode !== "none" && authMode !== "trusted-proxy");
-  const localTokenFallbackEnabled = remoteTokenFallback !== "remote-only";
-  const localTokenFallback = remoteTokenFallback === "remote-only" ? undefined : localToken;
-  const localPasswordFallback =
-    remotePasswordFallback === "remote-only" ? undefined : localPassword;
-  if (remoteTokenRef && !token && !envToken && !localTokenFallback && !password) {
-    throwUnresolvedGatewaySecretInput("gateway.remote.token");
-  }
-  if (remotePasswordRef && !password && !envPassword && !localPasswordFallback && !token) {
-    throwUnresolvedGatewaySecretInput("gateway.remote.password");
-  }
-  if (
-    localTokenRef &&
-    localTokenFallbackEnabled &&
-    !token &&
-    !password &&
-    !envToken &&
-    !remoteToken &&
-    localTokenCanWin
-  ) {
-    throwUnresolvedGatewaySecretInput("gateway.auth.token");
-  }
-
-  return { token, password };
+/** Resolve the stricter credential view used by Gateway probe paths. */
+export function resolveGatewayProbeCredentialsFromConfig(params: {
+  cfg: OpenClawConfig;
+  mode: GatewayCredentialMode;
+  env?: NodeJS.ProcessEnv;
+  explicitAuth?: ExplicitGatewayAuth;
+  urlOverride?: string;
+  urlOverrideSource?: "cli" | "env";
+}): ResolvedGatewayCredentials {
+  return resolveGatewayCredentialsFromConfig({
+    cfg: params.cfg,
+    env: params.env,
+    explicitAuth: params.explicitAuth,
+    urlOverride: params.urlOverride,
+    urlOverrideSource: params.urlOverrideSource,
+    modeOverride: params.mode,
+    remoteTokenFallback: "remote-only",
+  });
 }

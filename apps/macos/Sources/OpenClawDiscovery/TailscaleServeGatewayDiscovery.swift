@@ -1,7 +1,7 @@
 import Foundation
 import OpenClawKit
 
-struct TailscaleServeGatewayBeacon: Sendable, Equatable {
+struct TailscaleServeGatewayBeacon: Equatable {
     var displayName: String
     var tailnetDns: String
     var host: String
@@ -12,8 +12,9 @@ enum TailscaleServeGatewayDiscovery {
     private static let maxCandidates = 32
     private static let probeConcurrency = 6
     private static let defaultProbeTimeoutSeconds: TimeInterval = 1.6
+    private static let probeSession = URLSession(configuration: .ephemeral)
 
-    struct DiscoveryContext: Sendable {
+    struct DiscoveryContext {
         var tailscaleStatus: @Sendable () async -> String?
         var probeHost: @Sendable (_ host: String, _ timeout: TimeInterval) async -> Bool
 
@@ -85,13 +86,13 @@ enum TailscaleServeGatewayDiscovery {
         }
     }
 
-    private struct Candidate: Sendable {
+    private struct Candidate {
         var dnsName: String
         var displayName: String
     }
 
     private static func collectCandidates(status: TailscaleStatus) -> [Candidate] {
-        let selfDns = normalizeDnsName(status.selfNode?.dnsName)
+        let selfDns = self.normalizeDnsName(status.selfNode?.dnsName)
         var out: [Candidate] = []
         var seen = Set<String>()
 
@@ -112,7 +113,7 @@ enum TailscaleServeGatewayDiscovery {
 
             out.append(Candidate(
                 dnsName: dnsName,
-                displayName: displayName(hostName: node.hostName, dnsName: dnsName)))
+                displayName: self.displayName(hostName: node.hostName, dnsName: dnsName)))
 
             if out.count >= self.maxCandidates {
                 break
@@ -125,9 +126,7 @@ enum TailscaleServeGatewayDiscovery {
     private static func displayName(hostName: String?, dnsName: String) -> String {
         if let hostName {
             let trimmed = hostName.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                return trimmed
-            }
+            if !trimmed.isEmpty { return trimmed }
         }
         return dnsName
             .split(separator: ".")
@@ -154,7 +153,12 @@ enum TailscaleServeGatewayDiscovery {
 
         for candidate in candidates {
             guard let executable = self.resolveExecutablePath(candidate) else { continue }
-            if let stdout = await self.run(path: executable, args: ["status", "--json"], timeout: 1.0) {
+            if let stdout = await BoundedCommand.run(
+                path: executable,
+                arguments: ["status", "--json"],
+                environment: self.commandEnvironment(),
+                timeout: 1.0)
+            {
                 return stdout
             }
         }
@@ -191,40 +195,17 @@ enum TailscaleServeGatewayDiscovery {
         return nil
     }
 
-    private static func run(path: String, args: [String], timeout: TimeInterval) async -> String? {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                continuation.resume(returning: self.runBlocking(path: path, args: args, timeout: timeout))
-            }
+    static func commandEnvironment(
+        base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String]
+    {
+        var env = base
+        let term = env["TERM"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if term.isEmpty {
+            // The macOS Tailscale app binary exits with CLIError error 3 when TERM is missing,
+            // which is common for GUI-launched app environments.
+            env["TERM"] = "dumb"
         }
-    }
-
-    private static func runBlocking(path: String, args: [String], timeout: TimeInterval) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        let outPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if process.isRunning {
-            process.terminate()
-        }
-        process.waitUntilExit()
-
-        let data = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
-        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return output?.isEmpty == false ? output : nil
+        return env
     }
 
     private static func parseStatus(_ raw: String) -> TailscaleStatus? {
@@ -238,16 +219,13 @@ enum TailscaleServeGatewayDiscovery {
         components.host = host
         guard let url = components.url else { return false }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = max(0.5, timeout)
-        config.timeoutIntervalForResource = max(0.5, timeout)
-        let session = URLSession(configuration: config)
-        let task = session.webSocketTask(with: url)
+        // Discovery fans out and retries during startup. Reuse the session;
+        // AsyncTimeout owns each deadline and every websocket task owns its cancel.
+        let task = self.probeSession.webSocketTask(with: url)
         task.resume()
 
         defer {
             task.cancel(with: .goingAway, reason: nil)
-            session.invalidateAndCancel()
         }
 
         do {
@@ -257,7 +235,7 @@ enum TailscaleServeGatewayDiscovery {
                 operation: {
                     while true {
                         let message = try await task.receive()
-                        if isConnectChallenge(message: message) {
+                        if self.isConnectChallenge(message: message) {
                             return true
                         }
                     }

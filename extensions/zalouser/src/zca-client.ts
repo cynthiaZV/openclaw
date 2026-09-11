@@ -1,32 +1,18 @@
-import {
-  LoginQRCallbackEventType as LoginQRCallbackEventTypeRuntime,
-  Reactions as ReactionsRuntime,
-  ThreadType as ThreadTypeRuntime,
-  Zalo as ZaloRuntime,
-} from "zca-js";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+// Zalouser plugin module implements zca client behavior.
+import { TextStyle } from "./zca-constants.js";
 
-export const ThreadType = ThreadTypeRuntime as {
-  User: 0;
-  Group: 1;
+type ZcaJsRuntime = {
+  Zalo: unknown;
 };
 
-export const LoginQRCallbackEventType = LoginQRCallbackEventTypeRuntime as {
-  QRCodeGenerated: 0;
-  QRCodeExpired: 1;
-  QRCodeScanned: 2;
-  QRCodeDeclined: 3;
-  GotLoginInfo: 4;
-};
+// Keep zca-js behind a runtime boundary so bundled metadata/contracts can load
+// without resolving its optional WebSocket dependency tree.
+const loadZcaJsRuntime = createLazyRuntimeModule(() =>
+  import("zca-js").then((mod) => mod as unknown as ZcaJsRuntime),
+);
 
-export const Reactions = ReactionsRuntime as Record<string, string> & {
-  HEART: string;
-  LIKE: string;
-  HAHA: string;
-  WOW: string;
-  CRY: string;
-  ANGRY: string;
-  NONE: string;
-};
+export { TextStyle };
 
 export type Credentials = {
   imei: string;
@@ -115,7 +101,7 @@ export type LoginQRCallbackEvent =
       actions: null;
     };
 
-export type Listener = {
+type Listener = {
   on(event: "message", callback: (message: Message) => void): void;
   on(event: "error", callback: (error: unknown) => void): void;
   on(event: "closed", callback: (code: number, reason: string) => void): void;
@@ -125,6 +111,20 @@ export type Listener = {
   start(opts?: { retryOnClose?: boolean }): void;
   stop(): void;
 };
+
+type DeliveryEventMessage = {
+  msgId: string;
+  cliMsgId: string;
+  uidFrom: string;
+  idTo: string;
+  msgType: string;
+  st: number;
+  at: number;
+  cmd: number;
+  ts: string | number;
+};
+
+type DeliveryEventMessages = DeliveryEventMessage | DeliveryEventMessage[];
 
 export type API = {
   listener: Listener;
@@ -138,7 +138,7 @@ export type API = {
       cookies: unknown[];
     };
   };
-  fetchAccountInfo(): Promise<{ profile: User } | User>;
+  fetchAccountInfo(): Promise<User | { profile: User }>;
   getAllFriends(): Promise<User[]>;
   getOwnId(): string;
   getAllGroups(): Promise<{
@@ -163,9 +163,53 @@ export type API = {
     threadId: string,
     type?: number,
   ): Promise<{
+    msgId?: string | number;
     message?: { msgId?: string | number } | null;
     attachment?: Array<{ msgId?: string | number }>;
   }>;
+  uploadAttachment(
+    sources:
+      | string
+      | {
+          data: Buffer;
+          filename: `${string}.${string}`;
+          metadata: {
+            totalSize: number;
+            width?: number;
+            height?: number;
+          };
+        }
+      | Array<
+          | string
+          | {
+              data: Buffer;
+              filename: `${string}.${string}`;
+              metadata: {
+                totalSize: number;
+                width?: number;
+                height?: number;
+              };
+            }
+        >,
+    threadId: string,
+    type?: number,
+  ): Promise<
+    Array<{
+      fileType: "image" | "video" | "others";
+      fileUrl?: string;
+      msgId?: string | number;
+      fileId?: string;
+      fileName?: string;
+    }>
+  >;
+  sendVoice(
+    options: {
+      voiceUrl: string;
+      ttl?: number;
+    },
+    threadId: string,
+    type?: number,
+  ): Promise<{ msgId?: string | number }>;
   sendLink(
     payload: { link: string; msg?: string },
     threadId: string,
@@ -185,57 +229,10 @@ export type API = {
   ): Promise<unknown>;
   sendDeliveredEvent(
     isSeen: boolean,
-    messages:
-      | {
-          msgId: string;
-          cliMsgId: string;
-          uidFrom: string;
-          idTo: string;
-          msgType: string;
-          st: number;
-          at: number;
-          cmd: number;
-          ts: string | number;
-        }
-      | Array<{
-          msgId: string;
-          cliMsgId: string;
-          uidFrom: string;
-          idTo: string;
-          msgType: string;
-          st: number;
-          at: number;
-          cmd: number;
-          ts: string | number;
-        }>,
+    messages: DeliveryEventMessages,
     type?: number,
   ): Promise<unknown>;
-  sendSeenEvent(
-    messages:
-      | {
-          msgId: string;
-          cliMsgId: string;
-          uidFrom: string;
-          idTo: string;
-          msgType: string;
-          st: number;
-          at: number;
-          cmd: number;
-          ts: string | number;
-        }
-      | Array<{
-          msgId: string;
-          cliMsgId: string;
-          uidFrom: string;
-          idTo: string;
-          msgType: string;
-          st: number;
-          at: number;
-          cmd: number;
-          ts: string | number;
-        }>,
-    type?: number,
-  ): Promise<unknown>;
+  sendSeenEvent(messages: DeliveryEventMessages, type?: number): Promise<unknown>;
 };
 
 type ZaloCtor = new (options?: { logging?: boolean; selfListen?: boolean }) => {
@@ -246,4 +243,10 @@ type ZaloCtor = new (options?: { logging?: boolean; selfListen?: boolean }) => {
   ): Promise<API>;
 };
 
-export const Zalo = ZaloRuntime as unknown as ZaloCtor;
+export async function createZalo(
+  options?: ConstructorParameters<ZaloCtor>[0],
+): Promise<InstanceType<ZaloCtor>> {
+  const zcaJs = await loadZcaJsRuntime();
+  const Zalo = zcaJs.Zalo as ZaloCtor;
+  return new Zalo(options);
+}

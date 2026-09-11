@@ -1,54 +1,44 @@
-import type { OpenClawConfig } from "../config/config.js";
+/** Resolves gateway service auth tokens without leaking exec-backed secrets during install. */
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveSecretInputRef } from "../config/types.secrets.js";
-export { shouldRequireGatewayTokenForInstall } from "../gateway/auth-install-policy.js";
-import { secretRefKey } from "../secrets/ref-contract.js";
-import { resolveSecretRefValues } from "../secrets/resolve.js";
+import { resolveGatewayAuthToken } from "../gateway/auth-token-resolution.js";
 
-function readGatewayTokenEnv(env: NodeJS.ProcessEnv): string | undefined {
-  const value = env.OPENCLAW_GATEWAY_TOKEN ?? env.CLAWDBOT_GATEWAY_TOKEN;
-  const trimmed = value?.trim();
-  return trimmed || undefined;
-}
-
+/**
+ * Resolves the token a managed gateway service can receive at install/update time.
+ *
+ * Exec SecretRefs are skipped by default because the service installer cannot safely evaluate
+ * arbitrary commands. Configured SecretRefs never fall back to ambient credentials.
+ */
 export async function resolveGatewayAuthTokenForService(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv,
+  options: { allowExecSecretRefs?: boolean } = {},
 ): Promise<{ token?: string; unavailableReason?: string }> {
-  const { ref } = resolveSecretInputRef({
+  const tokenRef = resolveSecretInputRef({
     value: cfg.gateway?.auth?.token,
     defaults: cfg.secrets?.defaults,
+  }).ref;
+  if (tokenRef?.source === "exec" && options.allowExecSecretRefs !== true) {
+    return {
+      unavailableReason:
+        "gateway.auth.token SecretRef is configured but unavailable because exec SecretRef resolution is disabled.",
+    };
+  }
+  const resolved = await resolveGatewayAuthToken({
+    cfg,
+    env,
+    unresolvedReasonStyle: "detailed",
   });
-  const configToken =
-    ref || typeof cfg.gateway?.auth?.token !== "string"
-      ? undefined
-      : cfg.gateway.auth.token.trim() || undefined;
-  if (configToken) {
-    return { token: configToken };
+  if (resolved.token) {
+    return { token: resolved.token };
   }
-  if (ref) {
-    try {
-      const resolved = await resolveSecretRefValues([ref], {
-        config: cfg,
-        env,
-      });
-      const value = resolved.get(secretRefKey(ref));
-      if (typeof value === "string" && value.trim().length > 0) {
-        return { token: value.trim() };
-      }
-      const envToken = readGatewayTokenEnv(env);
-      if (envToken) {
-        return { token: envToken };
-      }
-      return { unavailableReason: "gateway.auth.token SecretRef resolved to an empty value." };
-    } catch (err) {
-      const envToken = readGatewayTokenEnv(env);
-      if (envToken) {
-        return { token: envToken };
-      }
-      return {
-        unavailableReason: `gateway.auth.token SecretRef is configured but unresolved (${String(err)}).`,
-      };
-    }
+  if (!resolved.secretRefConfigured) {
+    return {};
   }
-  return { token: readGatewayTokenEnv(env) };
+  if (resolved.unresolvedRefReason?.includes("resolved to an empty value")) {
+    return { unavailableReason: resolved.unresolvedRefReason };
+  }
+  return {
+    unavailableReason: `gateway.auth.token SecretRef is configured but unresolved (${resolved.unresolvedRefReason ?? "unknown reason"}).`,
+  };
 }

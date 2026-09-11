@@ -1,3 +1,7 @@
+/**
+ * Deliberately closed, core-owned vocabulary so every transport can render every action.
+ * Plugins add names through a core PR; runtime registration is intentionally unsupported.
+ */
 export const CHANNEL_MESSAGE_ACTION_NAMES = [
   "send",
   "broadcast",
@@ -37,6 +41,7 @@ export const CHANNEL_MESSAGE_ACTION_NAMES = [
   "channel-info",
   "channel-list",
   "channel-create",
+  "conversation-open",
   "channel-edit",
   "channel-delete",
   "channel-move",
@@ -44,14 +49,20 @@ export const CHANNEL_MESSAGE_ACTION_NAMES = [
   "category-edit",
   "category-delete",
   "topic-create",
+  "topic-edit",
   "voice-status",
   "event-list",
   "event-create",
   "timeout",
   "kick",
   "ban",
+  "set-profile",
   "set-presence",
   "download-file",
+  "upload-file",
 ] as const;
 
+/**
+ * Message action name union derived from the canonical action list.
+ */
 export type ChannelMessageActionName = (typeof CHANNEL_MESSAGE_ACTION_NAMES)[number];
